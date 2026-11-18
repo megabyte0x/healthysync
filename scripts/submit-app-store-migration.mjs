@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 import { appStoreAPI } from './app-store-api.mjs';
 import { appId, buildId, version, releaseNotes, reviewNotes } from './prepare-app-store-migration.mjs';
 
-export const versionId = 'eb0e4324-71f2-4266-ad00-55366fd570f2';
+export const versionId = '14af62aa-2d35-4e94-9b4f-baab97c391b9';
 const relation = (type, id) => ({ data: { type, id } });
 
 export async function submitPatch(api) {
