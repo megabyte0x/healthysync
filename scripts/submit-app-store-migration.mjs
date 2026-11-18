@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
 import { appStoreAPI } from './app-store-api.mjs';
-import { appId, buildId, version, releaseNotes } from './prepare-app-store-migration.mjs';
+import { appId, buildId, version, releaseNotes, reviewNotes } from './prepare-app-store-migration.mjs';
 
 export const versionId = 'eb0e4324-71f2-4266-ad00-55366fd570f2';
 const relation = (type, id) => ({ data: { type, id } });
 
-export async function submitMigration(api) {
+export async function submitPatch(api) {
     const target = await api(`appStoreVersions/${versionId}`, { query: { include: 'app,build,appStoreReviewDetail' } });
     const attrs = target.data.attributes, rels = target.data.relationships;
     assert.equal(attrs.versionString, version);
@@ -15,13 +15,14 @@ export async function submitMigration(api) {
     assert.equal(rels.app.data.id, appId);
     assert.equal(rels.build.data.id, buildId);
     if (['WAITING_FOR_REVIEW', 'IN_REVIEW', 'PENDING_APPLE_RELEASE', 'READY_FOR_SALE'].includes(attrs.appStoreState))
-        return { version, build: '35', state: attrs.appStoreState, alreadySubmitted: true };
+        return { version, build: '36', state: attrs.appStoreState, alreadySubmitted: true };
     assert(['PREPARE_FOR_SUBMISSION', 'READY_FOR_REVIEW'].includes(attrs.appStoreState), 'Unexpected version state');
     const build = target.included.find(x => x.type === 'builds' && x.id === buildId);
     assert.equal(build?.attributes.processingState, 'VALID');
     assert.equal(build.attributes.expired, false);
     const review = target.included.find(x => x.type === 'appStoreReviewDetails')?.attributes;
     assert(review && ['contactFirstName', 'contactLastName', 'contactPhone', 'contactEmail', 'notes'].every(k => review[k]), 'Review information incomplete');
+    assert.equal(review.notes, reviewNotes, 'Unexpected review instructions');
     assert.equal(review.demoAccountRequired, false, 'Unexpected demo account requirement');
     const locales = await api(`appStoreVersions/${versionId}/appStoreVersionLocalizations`, { query: { limit: '200' } });
     assert(!locales.links?.next && locales.data.length === 1 && locales.data[0].attributes.locale === 'en-US', 'Unexpected localization set');
@@ -55,10 +56,10 @@ export async function submitMigration(api) {
     const result = await api(`reviewSubmissions/${submission.id}`, { method: 'PATCH', data: {
         type: 'reviewSubmissions', id: submission.id, attributes: { submitted: true },
     } });
-    return { version, build: '35', versionId, submissionId: submission.id, state: result.data.attributes.state };
+    return { version, build: '36', versionId, submissionId: submission.id, state: result.data.attributes.state };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
     assert.equal(process.env.APP_VERSION, version, 'This submission is only for the verified migration');
-    console.log(JSON.stringify(await submitMigration(appStoreAPI()), null, 2));
+    console.log(JSON.stringify(await submitPatch(appStoreAPI()), null, 2));
 }

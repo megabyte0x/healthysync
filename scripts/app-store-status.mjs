@@ -11,7 +11,7 @@ const builds = await request('builds', { query: {
     'fields[builds]': 'version,processingState,uploadedDate,expired,preReleaseVersion',
     include: 'preReleaseVersion', 'fields[preReleaseVersions]': 'version,platform',
 } });
-const draft = versions.data.find(x => x.attributes.versionString === '1.0.3');
+const draft = versions.data.find(x => x.attributes.versionString === '1.0.4');
 let migrationDraft;
 if (draft) {
     const details = await get(`appStoreVersions/${draft.id}`, { include: 'build,appStoreReviewDetail' });

@@ -2,12 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, verify } from 'node:crypto';
 import { appStoreAPI } from './app-store-api.mjs';
-import { appId, buildId, prepareMigration, releaseNotes } from './prepare-app-store-migration.mjs';
-import { submitMigration, versionId } from './submit-app-store-migration.mjs';
+import { appId, buildId, preparePatch, releaseNotes, reviewNotes } from './prepare-app-store-migration.mjs';
+import { submitPatch, versionId } from './submit-app-store-migration.mjs';
 
-function fixture({ owner = appId, processing = 'VALID', state = 'PREPARE_FOR_SUBMISSION', selectedBuild = null, locale = 'en-US', existing = false, releaseType = 'AFTER_APPROVAL' } = {}) {
+function fixture({ owner = appId, processing = 'VALID', state = 'PREPARE_FOR_SUBMISSION', selectedBuild = null, locale = 'en-US', existing = false, releaseType = 'AFTER_APPROVAL', existingReviewNotes = reviewNotes } = {}) {
     const writes = [];
-    const target = { id: 'target', attributes: { versionString: '1.0.3', appStoreState: state, releaseType } };
+    const target = { id: 'target', attributes: { versionString: '1.0.4', appStoreState: state, releaseType } };
     return { writes, api: async (path, options = {}) => {
         if (options.method) {
             writes.push({ path, ...options });
@@ -15,14 +15,17 @@ function fixture({ owner = appId, processing = 'VALID', state = 'PREPARE_FOR_SUB
         }
         if (path === `apps/${appId}`) return { data: { attributes: { bundleId: 'com.megabyte0x.HealthSync' } } };
         if (path === `builds/${buildId}`) return {
-            data: { attributes: { version: '35', processingState: processing, expired: false }, relationships: { app: { data: { id: owner } }, preReleaseVersion: { data: { id: 'pre' } } } },
-            included: [{ type: 'preReleaseVersions', id: 'pre', attributes: { version: '1.0.3', platform: 'IOS' } }],
+            data: { attributes: { version: '36', processingState: processing, expired: false }, relationships: { app: { data: { id: owner } }, preReleaseVersion: { data: { id: 'pre' } } } },
+            included: [{ type: 'preReleaseVersions', id: 'pre', attributes: { version: '1.0.4', platform: 'IOS' } }],
         };
         if (path === `apps/${appId}/appStoreVersions`) return { data: [
-            { id: 'prior', attributes: { versionString: '1.0.2', appStoreState: 'READY_FOR_SALE', releaseType: 'AFTER_APPROVAL' } },
+            { id: 'prior', attributes: { versionString: '1.0.3', appStoreState: 'READY_FOR_SALE', releaseType: 'AFTER_APPROVAL' } },
             ...(existing ? [target] : []),
         ] };
-        if (path === 'appStoreVersions/target') return { data: { relationships: { build: { data: selectedBuild && { id: selectedBuild } } } } };
+        if (path === 'appStoreVersions/target') return {
+            data: { relationships: { build: { data: selectedBuild && { id: selectedBuild } } } },
+            included: [{ type: 'appStoreReviewDetails', id: 'review', attributes: { contactFirstName: 'Review', contactLastName: 'Contact', contactPhone: 'synthetic', contactEmail: 'synthetic@example.test', notes: existingReviewNotes, demoAccountRequired: false } }],
+        };
         if (path === 'appStoreVersions/target/appStoreVersionLocalizations') return { data: [{ id: 'english', attributes: { locale } }] };
         throw new Error(`Unexpected request ${path}`);
     } };
@@ -30,8 +33,8 @@ function fixture({ owner = appId, processing = 'VALID', state = 'PREPARE_FOR_SUB
 
 test('prepares only the verified candidate and preserves the existing release policy', async () => {
     const f = fixture();
-    const result = await prepareMigration(f.api);
-    assert.equal(result.version, '1.0.3');
+    const result = await preparePatch(f.api);
+    assert.equal(result.version, '1.0.4');
     assert.equal(result.releaseType, 'AFTER_APPROVAL');
     assert.deepEqual(f.writes.map(x => x.path), ['appStoreVersions', 'appStoreVersionLocalizations/english', 'appStoreVersions/target']);
     assert.equal(f.writes[1].data.attributes.whatsNew, releaseNotes);
@@ -42,7 +45,7 @@ test('prepares only the verified candidate and preserves the existing release po
 test('rejects an unrelated owner or unprocessed build before any write', async () => {
     for (const options of [{ owner: 'another-app' }, { processing: 'PROCESSING' }]) {
         const f = fixture(options);
-        await assert.rejects(prepareMigration(f.api));
+        await assert.rejects(preparePatch(f.api));
         assert.equal(f.writes.length, 0);
     }
 });
@@ -50,26 +53,26 @@ test('rejects an unrelated owner or unprocessed build before any write', async (
 test('does not replace another draft build or modify a version already in review', async () => {
     for (const options of [{ selectedBuild: 'another-build' }, { state: 'IN_REVIEW' }]) {
         const f = fixture({ existing: true, ...options });
-        await assert.rejects(prepareMigration(f.api));
+        await assert.rejects(preparePatch(f.api));
         assert.equal(f.writes.length, 0);
     }
 });
 
 test('resumes a prepared draft without recreating it or selecting another build', async () => {
     const f = fixture({ existing: true, selectedBuild: buildId });
-    await prepareMigration(f.api);
+    await preparePatch(f.api);
     assert.deepEqual(f.writes.map(x => x.path), ['appStoreVersionLocalizations/english']);
 });
 
 test('does not overwrite non-English localized release notes', async () => {
     const f = fixture({ existing: true, locale: 'ja' });
-    await assert.rejects(prepareMigration(f.api), /translations/);
+    await assert.rejects(preparePatch(f.api), /translations/);
     assert.equal(f.writes.length, 0);
 });
 
 test('does not overwrite a separately chosen draft release policy', async () => {
     const f = fixture({ existing: true, releaseType: 'MANUAL' });
-    await assert.rejects(prepareMigration(f.api), /release policy/);
+    await assert.rejects(preparePatch(f.api), /release policy/);
     assert.equal(f.writes.length, 0);
 });
 
@@ -110,11 +113,11 @@ function submissionFixture({ selectedBuild = buildId, state = 'PREPARE_FOR_SUBMI
             throw new Error(`Unexpected mutation ${path}`);
         }
         if (path === `appStoreVersions/${versionId}`) return {
-            data: { attributes: { versionString: '1.0.3', platform: 'IOS', releaseType: 'AFTER_APPROVAL', appStoreState: state },
+            data: { attributes: { versionString: '1.0.4', platform: 'IOS', releaseType: 'AFTER_APPROVAL', appStoreState: state },
                 relationships: { app: { data: { id: appId } }, build: { data: { id: selectedBuild } } } },
             included: [
                 { type: 'builds', id: buildId, attributes: { processingState: 'VALID', expired: false } },
-                { type: 'appStoreReviewDetails', attributes: { contactFirstName: 'Synthetic', contactLastName: 'Contact', contactPhone: 'synthetic', contactEmail: 'synthetic@example.test', notes: 'Synthetic review', demoAccountRequired: false } },
+                { type: 'appStoreReviewDetails', attributes: { contactFirstName: 'Synthetic', contactLastName: 'Contact', contactPhone: 'synthetic', contactEmail: 'synthetic@example.test', notes: reviewNotes, demoAccountRequired: false } },
             ],
         };
         if (path === `appStoreVersions/${versionId}/appStoreVersionLocalizations`) return { data: [{ id: 'english', attributes: { locale: 'en-US', whatsNew: releaseNotes, description: 'Synthetic app', supportUrl: 'https://example.test' } }] };
@@ -130,7 +133,7 @@ function submissionFixture({ selectedBuild = buildId, state = 'PREPARE_FOR_SUBMI
 
 test('submits only the verified prepared version and confirms the waiting state', async () => {
     const f = submissionFixture();
-    const result = await submitMigration(f.api);
+    const result = await submitPatch(f.api);
     assert.equal(result.state, 'WAITING_FOR_REVIEW');
     assert.deepEqual(f.writes.map(x => x.path), ['reviewSubmissions', 'reviewSubmissionItems', 'reviewSubmissions/submission']);
     assert.equal(f.writes[1].data.relationships.appStoreVersion.data.id, versionId);
@@ -140,13 +143,20 @@ test('submits only the verified prepared version and confirms the waiting state'
 test('never submits a changed build, another review item or unfinished screenshots', async () => {
     for (const options of [{ selectedBuild: 'another-build' }, { otherItem: true }, { screenshotState: 'UPLOADING' }, { screenshotCount: 1 }, { includedCount: 5 }, { displayType: 'APP_IPAD_PRO_3GEN_129' }]) {
         const f = submissionFixture(options);
-        await assert.rejects(submitMigration(f.api));
+        await assert.rejects(submitPatch(f.api));
         assert.equal(f.writes.length, 0);
     }
 });
 
 test('does not create duplicate review submissions for a version already waiting', async () => {
     const f = submissionFixture({ state: 'WAITING_FOR_REVIEW' });
-    assert.equal((await submitMigration(f.api)).alreadySubmitted, true);
+    assert.equal((await submitPatch(f.api)).alreadySubmitted, true);
     assert.equal(f.writes.length, 0);
+});
+
+test('updates inherited App Review instructions for explicit destination selection', async () => {
+    const f = fixture({ existing: true, selectedBuild: buildId, existingReviewNotes: 'Prior onboarding' });
+    await preparePatch(f.api);
+    const write = f.writes.find(x => x.path === 'appStoreReviewDetails/review');
+    assert.deepEqual(write.data.attributes, { notes: reviewNotes });
 });
