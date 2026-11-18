@@ -1,6 +1,7 @@
 import { appStoreAPI, appId } from './app-store-api.mjs';
 
 const request = appStoreAPI();
+const get = (path, query) => request(path, { query });
 
 const versions = await request(`apps/${appId}/appStoreVersions`, { query: {
     limit: '10', 'fields[appStoreVersions]': 'versionString,appStoreState,releaseType',
