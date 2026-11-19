@@ -24,6 +24,13 @@ struct OnboardingHealthDataView: View {
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
+
+                        if appState.settings.syncFrequency != .manualOnly {
+                            Text("After setup, HealthSync starts syncing available records for your selected types, including older records. iOS decides when background sync runs.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
 
                     VStack(spacing: 10) {

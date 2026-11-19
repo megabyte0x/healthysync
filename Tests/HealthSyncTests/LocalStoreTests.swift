@@ -372,6 +372,28 @@ final class LocalStoreTests: XCTestCase {
         XCTAssertEqual(remaining.map(\.destination), ["https://mine.example"])
     }
 
+    func testRetryMigrationPreservesPreviouslyBoundPendingUploads() async throws {
+        let url = temporaryDatabaseURL()
+        let batch = legacyBatch()
+        let payload = String(decoding: try PayloadJSON.encoder.encode(batch.payload), as: UTF8.self)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        for sql in [
+            "CREATE TABLE batches (id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, created_at REAL NOT NULL, uploaded_at REAL, attempt_count INTEGER NOT NULL, last_error TEXT, destination TEXT NOT NULL)",
+            "INSERT INTO batches VALUES ('\(batch.id.uuidString)', '\(payload)', 1, NULL, 1, 'Timed out', '\(batch.destination)')",
+            "PRAGMA user_version = 1"
+        ] {
+            XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, sql)
+        }
+        sqlite3_close(db)
+
+        let store = try SQLiteLocalStore(url: url)
+        let eligible = try await store.pendingRetries(destination: batch.destination, failed: true, now: Date(), createdBefore: nil, limit: 3)
+        XCTAssertEqual(eligible.map(\.id), [batch.id])
+        XCTAssertEqual(eligible.first?.payload, batch.payload)
+        XCTAssertEqual(eligible.first?.attemptCount, 1)
+    }
+
     func testSavingNarrowerSelectionPermanentlyFiltersPendingSamplesButKeepsDeletions() async throws {
         let url = temporaryDatabaseURL()
         let store = try SQLiteLocalStore(url: url)

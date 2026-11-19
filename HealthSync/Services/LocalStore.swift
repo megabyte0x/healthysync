@@ -188,6 +188,25 @@ actor SQLiteLocalStore: BatchPersisting {
         try readPendingBatches()
     }
 
+    func pendingRetries(destination: String, failed: Bool, now: Date, createdBefore: Date?, limit: Int) throws -> [SyncBatch] {
+        let eligibility = failed
+            ? "attempt_count > 0 AND (last_attempt_at IS NULL OR last_attempt_at <= ?)"
+            : "attempt_count = 0"
+        let statement = try prepare("""
+        SELECT id, payload_json, created_at, uploaded_at, attempt_count, last_error, destination
+        FROM batches WHERE uploaded_at IS NULL AND destination = ? AND created_at < ? AND \(eligibility)
+        ORDER BY attempt_count ASC, created_at ASC, rowid ASC LIMIT ?
+        """)
+        defer { sqlite3_finalize(statement) }
+        try bindText(destination, to: statement, at: 1)
+        sqlite3_bind_double(statement, 2, createdBefore?.timeIntervalSince1970 ?? .infinity)
+        if failed {
+            sqlite3_bind_double(statement, 3, now.addingTimeInterval(-15 * 60).timeIntervalSince1970)
+        }
+        sqlite3_bind_int(statement, failed ? 4 : 3, Int32(limit))
+        return try readBatches(from: statement)
+    }
+
     private func readPendingBatches(oldestFirst: Bool = false) throws -> [SyncBatch] {
         let sql = """
         SELECT id, payload_json, created_at, uploaded_at, attempt_count, last_error, destination
@@ -197,11 +216,17 @@ actor SQLiteLocalStore: BatchPersisting {
         """
         let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
+        return try readBatches(from: statement)
+    }
 
+    private func readBatches(from statement: OpaquePointer?) throws -> [SyncBatch] {
         var batches: [SyncBatch] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        var step = sqlite3_step(statement)
+        while step == SQLITE_ROW {
             batches.append(try readBatch(from: statement))
+            step = sqlite3_step(statement)
         }
+        guard step == SQLITE_DONE else { throw SQLiteStoreError.statementFailed(Self.message(from: db)) }
         return batches
     }
 
@@ -280,12 +305,13 @@ actor SQLiteLocalStore: BatchPersisting {
         try stepDone(statement)
     }
 
-    func markBatchFailed(id: UUID, errorMessage: String) async throws {
-        let sql = "UPDATE batches SET attempt_count = attempt_count + 1, last_error = ? WHERE id = ?"
+    func markBatchFailed(id: UUID, errorMessage: String, attemptedAt: Date) async throws {
+        let sql = "UPDATE batches SET attempt_count = attempt_count + 1, last_error = ?, last_attempt_at = ? WHERE id = ?"
         let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
         try bindText(errorMessage, to: statement, at: 1)
-        try bindText(id.uuidString, to: statement, at: 2)
+        sqlite3_bind_double(statement, 2, attemptedAt.timeIntervalSince1970)
+        try bindText(id.uuidString, to: statement, at: 3)
         try stepDone(statement)
     }
 
@@ -381,7 +407,7 @@ actor SQLiteLocalStore: BatchPersisting {
             destination TEXT NOT NULL DEFAULT ''
         )
         """, db: db)
-        try migrateQueueAuthorization(db: db)
+        try migrateQueue(db: db)
         try execute("""
         CREATE TABLE IF NOT EXISTS logs (
             id TEXT PRIMARY KEY,
@@ -392,8 +418,7 @@ actor SQLiteLocalStore: BatchPersisting {
         """, db: db)
     }
 
-    /// Pre-upgrade queues cannot prove which credential was approved for their payloads.
-    private static func migrateQueueAuthorization(db: OpaquePointer?) throws {
+    private static func migrateQueue(db: OpaquePointer?) throws {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, "SELECT user_version FROM pragma_user_version", -1, &statement, nil) == SQLITE_OK,
               sqlite3_step(statement) == SQLITE_ROW else {
@@ -402,21 +427,24 @@ actor SQLiteLocalStore: BatchPersisting {
         }
         let version = sqlite3_column_int(statement, 0)
         sqlite3_finalize(statement)
-        guard version < 1 else { return }
-
-        guard sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('batches') WHERE name = 'destination'", -1, &statement, nil) == SQLITE_OK else {
-            throw SQLiteStoreError.statementFailed(message(from: db))
-        }
-        let hasColumn = sqlite3_step(statement) == SQLITE_ROW
-        sqlite3_finalize(statement)
+        guard version < 2 else { return }
 
         try execute("BEGIN IMMEDIATE", db: db)
         do {
-            if !hasColumn {
-                try execute("ALTER TABLE batches ADD COLUMN destination TEXT NOT NULL DEFAULT ''", db: db)
+            if version < 1 {
+                guard sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('batches') WHERE name = 'destination'", -1, &statement, nil) == SQLITE_OK else {
+                    throw SQLiteStoreError.statementFailed(message(from: db))
+                }
+                let hasColumn = sqlite3_step(statement) == SQLITE_ROW
+                sqlite3_finalize(statement)
+                if !hasColumn {
+                    try execute("ALTER TABLE batches ADD COLUMN destination TEXT NOT NULL DEFAULT ''", db: db)
+                }
+                // Queues from version zero cannot prove which credential was approved.
+                try execute("DELETE FROM batches WHERE uploaded_at IS NULL", db: db)
             }
-            try execute("DELETE FROM batches WHERE uploaded_at IS NULL", db: db)
-            try execute("PRAGMA user_version = 1", db: db)
+            try execute("ALTER TABLE batches ADD COLUMN last_attempt_at REAL", db: db)
+            try execute("PRAGMA user_version = 2", db: db)
             try execute("COMMIT", db: db)
         } catch {
             try? execute("ROLLBACK", db: db)

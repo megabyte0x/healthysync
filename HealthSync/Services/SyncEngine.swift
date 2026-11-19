@@ -4,7 +4,7 @@ protocol BatchPersisting {
     func enqueueBatch(_ batch: SyncBatch) async throws
     func pendingBatches() async throws -> [SyncBatch]
     func markBatchUploaded(id: UUID, result: UploadResult) async throws
-    func markBatchFailed(id: UUID, errorMessage: String) async throws
+    func markBatchFailed(id: UUID, errorMessage: String, attemptedAt: Date) async throws
     func appendLog(_ log: SyncLogEntry) async throws
     func recordSyncAttempt(at date: Date) async throws
     func recordSyncSuccess(at date: Date) async throws
@@ -29,6 +29,7 @@ struct SyncRunResult: Equatable {
     let uploadedCount: Int
     let failedCount: Int
     let messages: [String]
+    var lastFailure: String? = nil
 
     static let empty = SyncRunResult(uploadedCount: 0, failedCount: 0, messages: [])
 }
@@ -59,24 +60,27 @@ actor SyncEngine {
         do {
             let pending = try await store.pendingBatches()
                 .filter { $0.destination == configuration.destination }
-            return await upload(batches: pending, configuration: configuration)
+            return await upload(batches: pending, configuration: configuration, attemptedAt: Date())
         } catch {
             let message = safeMessage(from: error, token: configuration.token)
             try? await store.appendLog(SyncLogEntry(level: .error, message: message))
-            return SyncRunResult(uploadedCount: 0, failedCount: 1, messages: [message])
+            return SyncRunResult(uploadedCount: 0, failedCount: 1, messages: [message], lastFailure: message)
         }
     }
 
     func uploadQueuedBatch(_ batch: SyncBatch, configuration: UploadConfiguration) async -> SyncRunResult {
+        await uploadQueuedBatches([batch], configuration: configuration, attemptedAt: Date())
+    }
+
+    func uploadQueuedBatches(_ batches: [SyncBatch], configuration: UploadConfiguration, attemptedAt: Date) async -> SyncRunResult {
         guard !isUploading else { return .empty }
         isUploading = true
         defer { isUploading = false }
 
-        return await upload(batches: [batch], configuration: configuration)
+        return await upload(batches: batches, configuration: configuration, attemptedAt: attemptedAt)
     }
 
-    private func upload(batches: [SyncBatch], configuration: UploadConfiguration) async -> SyncRunResult {
-        let attemptedAt = Date()
+    private func upload(batches: [SyncBatch], configuration: UploadConfiguration, attemptedAt: Date) async -> SyncRunResult {
         do {
             try await store.recordSyncAttempt(at: attemptedAt)
             guard !batches.isEmpty else { return .empty }
@@ -84,16 +88,20 @@ actor SyncEngine {
             var uploaded = 0
             var failed = 0
             var messages: [String] = []
+            var lastFailure: String?
 
             for batch in batches {
                 if Task.isCancelled {
                     failed += 1
-                    messages.append("Sync cancelled. Queued uploads will retry.")
+                    let message = "Sync cancelled. Queued uploads will retry."
+                    lastFailure = message
+                    messages.append(message)
                     break
                 }
                 guard !configuration.destination.isEmpty, batch.destination == configuration.destination else {
                     failed += 1
                     let message = SyncLogMessages.destinationMismatch(batch: batch, configuration: configuration)
+                    lastFailure = message
                     messages.append(message)
                     try? await store.appendLog(SyncLogEntry(level: .error, message: message))
                     continue
@@ -110,22 +118,25 @@ actor SyncEngine {
                 } catch {
                     if error is CancellationError || (error as? URLError)?.code == .cancelled {
                         failed += 1
-                        messages.append("Sync cancelled. Queued uploads will retry.")
+                        let message = "Sync cancelled. Queued uploads will retry."
+                        lastFailure = message
+                        messages.append(message)
                         break
                     }
                     failed += 1
                     let message = safeMessage(from: error, token: configuration.token)
+                    lastFailure = message
                     messages.append(message)
-                    try? await store.markBatchFailed(id: batch.id, errorMessage: message)
+                    try? await store.markBatchFailed(id: batch.id, errorMessage: message, attemptedAt: attemptedAt)
                     try? await store.appendLog(SyncLogEntry(level: .error, message: message))
                 }
             }
 
-            return SyncRunResult(uploadedCount: uploaded, failedCount: failed, messages: messages)
+            return SyncRunResult(uploadedCount: uploaded, failedCount: failed, messages: messages, lastFailure: lastFailure)
         } catch {
             let message = safeMessage(from: error, token: configuration.token)
             try? await store.appendLog(SyncLogEntry(level: .error, message: message))
-            return SyncRunResult(uploadedCount: 0, failedCount: 1, messages: [message])
+            return SyncRunResult(uploadedCount: 0, failedCount: 1, messages: [message], lastFailure: message)
         }
     }
 
@@ -166,7 +177,7 @@ actor IncrementalSyncRunner {
             result = try await reader.fetchIncremental(types: types, anchors: anchors)
         } catch {
             try Task.checkCancellation()
-            try? await retryPending(configuration: configuration, now: now, calendar: calendar)
+            try? await retryPending(configuration: configuration, now: now)
             throw error
         }
         try Task.checkCancellation()
@@ -178,7 +189,7 @@ actor IncrementalSyncRunner {
         for (type, anchor) in result.anchors {
             try await store.saveAnchor(anchor, for: type)
         }
-        try await upload(batches, configuration: configuration)
+        try await uploadNewBatches(batches, configuration: configuration, now: now)
 
         let recentTypes = types.intersection([.stepCount, .sleepAnalysis, .workouts])
         if !recentTypes.isEmpty,
@@ -189,15 +200,21 @@ actor IncrementalSyncRunner {
                 recent = try await reader.fetchSamples(types: recentTypes, start: start, end: now)
             } catch {
                 try Task.checkCancellation()
-                try? await retryPending(configuration: configuration, now: now, calendar: calendar)
+                try? await retryPending(configuration: configuration, now: now)
                 throw error
             }
             try Task.checkCancellation()
             let recentBatches = try await queue(recent, deletions: [], configuration: configuration,
                 range: SyncDateRange(start: start, end: now), timezone: calendar.timeZone.identifier)
-            try await upload(recentBatches, configuration: configuration)
+            try await uploadNewBatches(recentBatches, configuration: configuration, now: now)
         }
-        try await retryPending(configuration: configuration, now: now, calendar: calendar)
+        try await retryPending(configuration: configuration, now: now)
+    }
+
+    func retryAllPending(configuration: UploadConfiguration) async throws -> SyncRunResult {
+        try Task.checkCancellation()
+        try await store.splitOversizedPendingBatches(maxRecords: 100)
+        return await engine.uploadPending(configuration: configuration)
     }
 
     private func queue(_ samples: HealthKitFetchResult, deletions: [HealthRecordDeletion], configuration: UploadConfiguration,
@@ -213,22 +230,30 @@ actor IncrementalSyncRunner {
         return batches
     }
 
-    private func upload(_ batches: [SyncBatch], configuration: UploadConfiguration) async throws {
-        for batch in batches {
+    private func uploadNewBatches(_ batches: [SyncBatch], configuration: UploadConfiguration, now: Date) async throws {
+        do {
+            for batch in batches {
+                try await upload([batch], configuration: configuration, now: now)
+            }
+        } catch {
             try Task.checkCancellation()
-            let result = await engine.uploadQueuedBatch(batch, configuration: configuration)
-            try Task.checkCancellation()
-            try BackfillSync.validateUpload(result)
+            // Keep the remainder of the new export queued and give existing failures a retry opportunity.
+            try? await retryPending(configuration: configuration, now: now, createdBefore: batches.first?.createdAt)
+            throw error
         }
     }
 
-    private func retryPending(configuration: UploadConfiguration, now: Date, calendar: Calendar) async throws {
-        let pending = try await store.pendingBatches().filter { $0.destination == configuration.destination }
-        let unattempted = Array(pending.filter { $0.attemptCount == 0 }.prefix(3))
-        try await upload(unattempted, configuration: configuration)
-        if let stale = pending.first(where: { $0.attemptCount > 0 }),
-           try await store.claimDailyMaintenance("stale_batch", now: now, calendar: calendar) {
-            try await upload([stale], configuration: configuration)
-        }
+    private func upload(_ batches: [SyncBatch], configuration: UploadConfiguration, now: Date) async throws {
+        guard !batches.isEmpty else { return }
+        try Task.checkCancellation()
+        let result = await engine.uploadQueuedBatches(batches, configuration: configuration, attemptedAt: now)
+        try Task.checkCancellation()
+        try BackfillSync.validateUpload(result)
+    }
+
+    private func retryPending(configuration: UploadConfiguration, now: Date, createdBefore: Date? = nil) async throws {
+        let failed = try await store.pendingRetries(destination: configuration.destination, failed: true, now: now, createdBefore: createdBefore, limit: 3)
+        let unattempted = try await store.pendingRetries(destination: configuration.destination, failed: false, now: now, createdBefore: createdBefore, limit: 3)
+        try await upload(unattempted + failed, configuration: configuration, now: now)
     }
 }

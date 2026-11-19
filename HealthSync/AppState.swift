@@ -2,12 +2,19 @@ import Foundation
 import BackgroundTasks
 import SwiftUI
 
+@MainActor
 struct BackgroundSyncScheduler {
     static let taskIdentifier = "com.megabyte0x.HealthSync.background-sync"
 
-    func reschedule(for frequency: SyncFrequency, now: Date = Date()) throws {
-        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.taskIdentifier)
+    func scheduleIfNeeded(for frequency: SyncFrequency, now: Date = Date()) async throws {
         guard let earliestBeginDate = BackgroundSyncSchedule.earliestBeginDate(for: frequency, now: now) else {
+            return
+        }
+
+        let pending = await BGTaskScheduler.shared.pendingTaskRequests()
+        try Task.checkCancellation()
+        if let request = pending.first(where: { $0.identifier == Self.taskIdentifier }),
+           (request.earliestBeginDate ?? .distantPast) <= earliestBeginDate {
             return
         }
 
@@ -124,7 +131,7 @@ enum BackfillSync {
 
     static func validateUpload(_ result: SyncRunResult) throws {
         guard result.failedCount == 0 else {
-            throw BackfillSyncError.uploadFailed(result.messages.last ?? "Backfill upload failed.")
+            throw BackfillSyncError.uploadFailed(result.lastFailure ?? result.messages.last ?? "Upload failed.")
         }
         guard result.uploadedCount > 0 else {
             throw BackfillSyncError.uploadFailed("Upload is still queued. Retry after the current sync finishes.")
@@ -171,6 +178,7 @@ final class AppState: ObservableObject {
     private let keychain: any TokenProviding
     private let backgroundSyncScheduler = BackgroundSyncScheduler()
     private var periodicSyncTask: Task<Void, Never>?
+    private var backgroundSchedulingTask: Task<Void, Never>?
     /// The one handle for the current busy operation; `stopSync()` cancels it.
     private var busyOperation: Task<Void, Never>?
     private var bootstrapTask: Task<Void, Never>?
@@ -243,6 +251,7 @@ final class AppState: ObservableObject {
 
     func connectAppleHealth() async {
         guard !isSavingSettings else { return }
+        var completedInitialSetup = false
         await runBusy { [self] in
             guard settings.storageMode != nil else { throw APIClientError.noStorageDestination }
             let types = settings.selectedTypes
@@ -251,7 +260,9 @@ final class AppState: ObservableObject {
             } else {
                 try await healthKit.requestReadPermissions(for: types)
             }
+            let isInitialSetup = !settings.hasRequestedHealthPermissions
             try await saveHealthSelection(types)
+            completedInitialSetup = isInitialSetup
             shouldShowOnboarding = false
             permissionSummary = "Requested"
             actionFeedback = types.isEmpty
@@ -260,6 +271,9 @@ final class AppState: ObservableObject {
             await startObserversIfPossible()
             restartPeriodicSync()
             await refresh()
+        }
+        if completedInitialSetup && !isBusy && !Task.isCancelled {
+            await syncAutomatically()
         }
     }
 
@@ -599,6 +613,21 @@ final class AppState: ObservableObject {
         }
     }
 
+    func retryPendingQueue() async {
+        await runBusy(stoppable: true) { [self] in
+            guard let incrementalSyncRunner else { throw APIClientError.invalidResponse }
+            let configuration = try await uploadConfiguration()
+            let result = try await incrementalSyncRunner.retryAllPending(configuration: configuration)
+            try Task.checkCancellation()
+            if result.failedCount > 0 {
+                try BackfillSync.validateUpload(result)
+            }
+            actionFeedback = result.uploadedCount > 0
+                ? HealthActionFeedback(kind: .success, message: "Pending uploads completed.")
+                : HealthActionFeedback(kind: .info, message: "No pending uploads for this destination.")
+        }
+    }
+
     /// Manual only pauses automatic sync at once; other cadences apply with "Apply frequency".
     func setSyncFrequency(_ frequency: SyncFrequency) async {
         guard !isSavingSettings else { return }
@@ -606,6 +635,7 @@ final class AppState: ObservableObject {
         guard frequency == .manualOnly else { return }
         periodicSyncTask?.cancel()
         periodicSyncTask = nil
+        backgroundSchedulingTask?.cancel()
         backgroundSyncScheduler.cancel()
         await healthKit.stopObserverQueries(disabling: Set(HealthDataType.allCases))
         await applySyncFrequency()
@@ -620,6 +650,8 @@ final class AppState: ObservableObject {
             try await store.updateSettings { $0.syncFrequency = frequency }
             backendFeedback = HealthActionFeedback(kind: .success, message: "Background sync frequency saved.")
             await startObserversIfPossible()
+            backgroundSchedulingTask?.cancel()
+            backgroundSyncScheduler.cancel()
             restartPeriodicSync()
         } catch {
             backendFeedback = .failure(userMessage(from: error))
@@ -629,19 +661,24 @@ final class AppState: ObservableObject {
     func performBackgroundSync() async {
         await bootstrap()
         restartPeriodicSync()
-        guard canRunAutomaticSync else { return }
-        _ = await syncIncremental()
+        await backgroundSchedulingTask?.value
+        guard !Task.isCancelled else { return }
+        await syncAutomatically()
     }
 
     func sceneDidBecomeActive() async {
         await bootstrap()
         restartPeriodicSync()
-        guard canRunAutomaticSync else { return }
-        _ = await syncIncremental()
+        await syncAutomatically()
     }
 
     func sceneDidEnterBackground() {
         restartPeriodicSync()
+    }
+
+    private func syncAutomatically() async {
+        guard canRunAutomaticSync else { return }
+        _ = await syncIncremental()
     }
 
     private func syncIncrementalThrowing() async throws {
@@ -763,7 +800,7 @@ final class AppState: ObservableObject {
                 types: approvedTypes,
                 frequency: settings.syncFrequency
             ) { [weak self] _ in
-                await self?.syncIncremental()
+                await self?.syncAutomatically()
             }
         } catch {
             lastError = userMessage(from: error)
@@ -772,15 +809,21 @@ final class AppState: ObservableObject {
 
     private func restartPeriodicSync() {
         periodicSyncTask?.cancel()
-        backgroundSyncScheduler.cancel()
-        guard settings.hasRequestedHealthPermissions, hasUsableUploadConfiguration() else { return }
-        guard let interval = settings.syncFrequency.intervalSeconds else { return }
-        do {
-            try backgroundSyncScheduler.reschedule(for: settings.syncFrequency)
-        } catch {
-            let message = "iOS could not schedule the next background sync: \(error.localizedDescription)"
-            Task { [weak self] in
-                try? await self?.store?.appendLog(SyncLogEntry(level: .error, message: message))
+        backgroundSchedulingTask?.cancel()
+        guard canRunAutomaticSync, let interval = settings.syncFrequency.intervalSeconds else {
+            backgroundSyncScheduler.cancel()
+            return
+        }
+        let frequency = settings.syncFrequency
+        backgroundSchedulingTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await backgroundSyncScheduler.scheduleIfNeeded(for: frequency)
+            } catch where !Task.isCancelled {
+                let message = "iOS could not schedule the next background sync: \(error.localizedDescription)"
+                try? await store?.appendLog(SyncLogEntry(level: .error, message: message))
+            } catch {
+                // A newer scheduling request superseded this one.
             }
         }
         periodicSyncTask = Task { [weak self] in
@@ -788,7 +831,7 @@ final class AppState: ObservableObject {
                 try? await Task.sleep(nanoseconds: interval * 1_000_000_000)
                 guard !Task.isCancelled else { return }
                 // Restarting the timer must not cancel a sync it already started.
-                _ = await Task { await self?.syncIncremental() }.value
+                await Task { await self?.syncAutomatically() }.value
             }
         }
     }

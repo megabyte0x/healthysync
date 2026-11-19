@@ -328,7 +328,7 @@ struct DashboardView: View {
 
     private var pendingQueueRow: some View {
         let status = appState.status
-        return HStack(spacing: 12) {
+        return VStack(alignment: .leading, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Pending queue")
                     .font(.subheadline.weight(.semibold))
@@ -337,22 +337,12 @@ struct DashboardView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Spacer(minLength: 8)
-            Button(role: .destructive) {
-                isConfirmingClearQueue = true
-            } label: {
-                Text("Clear")
-                    .font(.subheadline.weight(.semibold))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(Capsule().fill(HealthSyncTheme.primaryRed.opacity(0.12)))
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) { pendingQueueActions }
+                VStack(alignment: .leading, spacing: 8) { pendingQueueActions }
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(HealthSyncTheme.primaryRed)
-            .disabled(appState.isBusy)
-            .opacity(appState.isBusy ? 0.45 : 1)
-            .accessibilityLabel("Clear pending queue")
-            .accessibilityIdentifier("clear-pending-queue-button")
+            .controlSize(.large)
+            .disabled(appState.isBusy || appState.isSavingSettings)
         }
         .confirmationDialog(
             "Clear pending queue?",
@@ -372,6 +362,22 @@ struct DashboardView: View {
         } message: {
             Text("This clears only this iPhone’s queue. Automatic sync won’t recover discarded records. By default, Historical Sync sends new daily summaries for quantity metrics, not the original samples. Queued deletions are lost, so those records stay on the server.")
         }
+    }
+
+    @ViewBuilder
+    private var pendingQueueActions: some View {
+        Button("Retry uploads") {
+            Task { await appState.retryPendingQueue() }
+        }
+        .buttonStyle(.borderedProminent)
+        .accessibilityIdentifier("retry-pending-queue-button")
+
+        Button("Clear", role: .destructive) {
+            isConfirmingClearQueue = true
+        }
+        .buttonStyle(.bordered)
+        .accessibilityLabel("Clear pending queue")
+        .accessibilityIdentifier("clear-pending-queue-button")
     }
 
     private var healthPermissionPresentation: HealthPermissionPromptPresentation {
